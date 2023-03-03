@@ -1,59 +1,96 @@
 pipeline {
-agent any
+	agent any
 
+	//Configure the following environment variables before executing the Jenkins Job	
 	environment {
-	CPI_TENANT = "${env.MY_CPI_HOST}"
-	CPI_CRED = "${env.MY_CPI_CREDS}"	
-        IFLOW_ID = "sender2"
-        GIT_MAIL = "${env.MY_GIT_MAIL}"
-        GIT_USER = "${env.MY_GIT_USER}"
-	GIT_URL  = "${env.MY_GIT_URL}"
-	REPO_NAME = 'IO-PM'
-	GIT_CREDS = "${env.MY_GIT_CREDS}"
-    	}
-
+		IntegrationFlowID = "sender2"
+		CPIHost = "${env.MY_CPI_HOST}"
+		CPIOAuthHost = "${env.CPI_OAUTH_HOST}"
+		CPIOAuthCredentials = "${env.MY_CPI_CREDS}"	
+		GITRepositoryURL  = "${env.MY_GIT_URL}"
+		GITCredentials = "${env.MY_GIT_CREDS}"
+		GITBranch = "${env.GIT_BRANCH_NAME}"
+		GITFolder = "IntegrationContent/IntegrationArtefacts"
+		GITComment = "Integration Artefacts update from CICD pipeline"
+   	}
+	
 	stages {
-		stage('compare versions and store new version') {
-		 steps {
-		    deleteDir()
-		script {
-		//download and extract flow from tenant
-		    def tempfile=UUID.randomUUID().toString() + ".zip";
-                    def response = httpRequest acceptType: 'APPLICATION_ZIP', authentication: "${env.CPI_CRED}" , contentType: 'APPLICATION_ZIP', ignoreSslErrors: true, responseHandle: 'LEAVE_OPEN', timeout: 30,  outputFile: tempfile,url: 'https://' + "${env.CPI_TENANT}" + '/api/v1/IntegrationDesigntimeArtifacts(Id=\''+ "${env.IFLOW_ID}" + '\',Version=\'active\')/$value';
-                    def disposition = response.headers.toString();
-                    println(disposition);
-                    def index=disposition.indexOf('filename')+9;
-                    def lastindex=disposition.indexOf('.zip', index);
-                    def filename=disposition.substring(index + 1, lastindex + 4);
-                    def folder=filename.substring(0, filename.indexOf('.zip'));
-                    fileOperations([fileUnZipOperation(filePath: tempfile, targetLocation: folder)])
-                    response.close();
+		stage('download integration artefact and store it in Git') {
+			steps {
+			 	deleteDir()
+				script {
+					//clone repo 
+					checkout([
+						$class: 'GitSCM',
+						branches: [[name: env.GITBranch]],
+						doGenerateSubmoduleConfigurations: false,
+						extensions: [
+							[$class: 'RelativeTargetDirectory',relativeTargetDir: "."],
+							[$class: 'SparseCheckoutPaths',  sparseCheckoutPaths:[[$class:'SparseCheckoutPath', path: env.GITFolder]]]
+						],
+						submoduleCfg: [],
+						userRemoteConfigs: [[
+							credentialsId: env.GITCredentials,
+							url: 'https://' + env.GITRepositoryURL
+						]]
+					])
+					
+					//get token
+					println("Request token");
+					def token;
+					try{
+					def getTokenResp = httpRequest acceptType: 'APPLICATION_JSON', 
+						authentication: env.CPIOAuthCredentials, 
+						contentType: 'APPLICATION_JSON', 
+						httpMode: 'POST', 
+						responseHandle: 'LEAVE_OPEN', 
+						timeout: 30, 
+						url: 'https://' + env.CPIOAuthHost + '/oauth/token?grant_type=client_credentials';
+					def jsonObjToken = readJSON text: getTokenResp.content
+					token = "Bearer " + jsonObjToken.access_token
+				   	} catch (Exception e) {
+						error("Requesting the oauth token for Cloud Integration failed:\n${e}")
+					}
+					//delete the old flow content so that only the latest content gets stored
+					dir(env.GITFolder + '/' + env.IntegrationFlowID){
+						deleteDir();
+					}
+					//download and extract artefact from tenant
+					println("Downloading artefact");
+					def tempfile = UUID.randomUUID().toString() + ".zip";
+					def cpiDownloadResponse = httpRequest acceptType: 'APPLICATION_ZIP', 
+						customHeaders: [[maskValue: false, name: 'Authorization', value: token]], 
+						ignoreSslErrors: false, 
+						responseHandle: 'LEAVE_OPEN', 
+						validResponseCodes: '100:399, 404',
+						timeout: 30,  
+						outputFile: tempfile,
+						url: 'https://' + env.CPIHost + '/api/v1/IntegrationDesigntimeArtifacts(Id=\''+ env.IntegrationFlowID + '\',Version=\'active\')/$value';
+					if (cpiDownloadResponse.status == 404){
+						//invalid Flow ID
+						error("Received http status code 404. Please check if the Artefact ID that you have provided exists on the tenant.");
+					}
+					def disposition = cpiDownloadResponse.headers.toString();
+					def index=disposition.indexOf('filename')+9;
+					def lastindex=disposition.indexOf('.zip', index);
+					def filename=disposition.substring(index + 1, lastindex + 4);
+					def folder=env.GITFolder + '/' + filename.substring(0, filename.indexOf('.zip'));
+					fileOperations([fileUnZipOperation(filePath: tempfile, targetLocation: folder)])
+					cpiDownloadResponse.close();
 
-		   //remove the zip
-                    fileOperations([fileDeleteOperation(excludes: '', includes: tempfile)])
-		     		
-		  //push the folder content to Git
-                    sh 'git config --global user.email ${GIT_MAIL}'
-                    sh 'git config --global user.name  ${GIT_USER}'
-                    
-                    //clone git remote repo
-                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: "${env.GIT_CREDS}" ,usernameVariable: 'GIT_AUTHOR_NAME', passwordVariable: 'GIT_PASSWORD']]) {    
-				      sh('git clone https://${GIT_AUTHOR_NAME}:${GIT_PASSWORD}@' + "${env.MY_GIT_URL}")
-                     }
-            		//modify local repo
-            		fileOperations([fileCopyOperation(excludes: '', flattenFiles: false, includes: folder+"/**", targetLocation: "./" + "${env.REPO_NAME}" + "/IntegrationContent/IntegrationArtefacts/")])
-   		   
-		    def dirName = "${env.REPO_NAME}"
-			
-                    //update remote repo
-	                dir(dirName) {
-    					withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: "${env.GIT_CREDS}" ,usernameVariable: 'GIT_AUTHOR_NAME', passwordVariable: 'GIT_PASSWORD']]) {    
-    						sh 'git commit -am "flow update from CPI pipeline"'
-                            			sh('git push https://${GIT_AUTHOR_NAME}:${GIT_PASSWORD}@' + "${env.MY_GIT_URL}")
-                         }
-	                 }
+					//remove the zip
+					fileOperations([fileDeleteOperation(excludes: '', includes: tempfile)])
+						
+					dir(folder){
+						sh 'git add .'
+					}
+					println("Store integration artefact in Git")
+					withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: env.GITCredentials ,usernameVariable: 'GIT_AUTHOR_NAME', passwordVariable: 'GIT_PASSWORD']]) {  
+						sh 'git diff-index --quiet HEAD || git commit -am ' + '\'' + env.GitComment + '\''
+						sh('git push https://${GIT_AUTHOR_NAME}:${GIT_PASSWORD}@' + env.GITRepositoryURL + ' HEAD:' + env.GITBranch)
+					}				
 				}
 			}
 		}
-	}
+    }
 }
