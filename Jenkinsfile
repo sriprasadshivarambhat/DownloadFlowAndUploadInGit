@@ -4,7 +4,7 @@ agent any
 	environment {
 	CPI_TENANT = "${env.MY_CPI_HOST}"
 	CPI_CRED = "${env.MY_CPI_CREDS}"	
-        IFLOW_ID = "flow1"
+        IFLOW_ID = "sender2"
         GIT_MAIL = "${env.MY_GIT_MAIL}"
         GIT_USER = "${env.MY_GIT_USER}"
 	GIT_URL  = "${env.MY_GIT_URL}"
